@@ -8,6 +8,10 @@ set(CMAKE_C_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+enable_testing()
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+find_program(GMAKE_EXECUTABLE NAMES gmake make REQUIRED)
+
 find_program(LLVM_CONFIG_EXECUTABLE NAMES llvm-config-22 llvm-config REQUIRED)
 
 function(bfjit_query_llvm_config output_variable option)
@@ -70,3 +74,78 @@ set_target_properties(libbfjit PROPERTIES OUTPUT_NAME bfjit)
 
 add_executable(bfjit src/main.c)
 target_link_libraries(bfjit PRIVATE libbfjit)
+
+set(BFJIT_HYDROGEN_SOURCE_DIR "/tmp/Brainfuck/extras" CACHE PATH
+    "Path to the Brainfuck repo extras directory containing hydrogen.c")
+set(BFJIT_HYDROGEN_BINARY "${BFJIT_HYDROGEN_SOURCE_DIR}/hydrogen8")
+
+if(NOT EXISTS "${BFJIT_HYDROGEN_SOURCE_DIR}/hydrogen.c")
+    message(FATAL_ERROR
+        "hydrogen.c was not found in ${BFJIT_HYDROGEN_SOURCE_DIR}. "
+        "Clone https://github.com/rdebath/Brainfuck and point BFJIT_HYDROGEN_SOURCE_DIR to its extras directory.")
+endif()
+
+add_custom_command(
+    OUTPUT "${BFJIT_HYDROGEN_BINARY}"
+    COMMAND "${GMAKE_EXECUTABLE}" -f GNUmakefile hydrogen8
+    WORKING_DIRECTORY "${BFJIT_HYDROGEN_SOURCE_DIR}"
+    DEPENDS
+        "${BFJIT_HYDROGEN_SOURCE_DIR}/GNUmakefile"
+        "${BFJIT_HYDROGEN_SOURCE_DIR}/hydrogen.c"
+        "${BFJIT_HYDROGEN_SOURCE_DIR}/ov_int.h"
+    COMMENT "Building hydrogen8 benchmark interpreter"
+    VERBATIM
+)
+add_custom_target(hydrogen_benchmark ALL DEPENDS "${BFJIT_HYDROGEN_BINARY}")
+
+set(BFJIT_BENCHMARK_CASE_DIR "${CMAKE_CURRENT_BINARY_DIR}/benchmark_cases")
+add_custom_command(
+    OUTPUT
+        "${BFJIT_BENCHMARK_CASE_DIR}/mandelbrot_x2.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/hanoi_x2.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/deep_nesting_512.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/wide_sweep_24k_x128.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/arith_pipeline_4k.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/copy_restore_2k.bf"
+    COMMAND
+        "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/suite.py"
+        generate "${BFJIT_BENCHMARK_CASE_DIR}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/benchmark/suite.py"
+    COMMENT "Generating benchmark cases"
+    VERBATIM
+)
+add_custom_target(benchmark_cases ALL
+    DEPENDS
+        "${BFJIT_BENCHMARK_CASE_DIR}/mandelbrot_x2.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/hanoi_x2.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/deep_nesting_512.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/wide_sweep_24k_x128.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/arith_pipeline_4k.bf"
+        "${BFJIT_BENCHMARK_CASE_DIR}/copy_restore_2k.bf"
+)
+
+function(bfjit_add_benchmark_case case_name source_file)
+    add_test(
+        NAME "benchmark_bfjit_${case_name}"
+        COMMAND "$<TARGET_FILE:bfjit>" "${source_file}"
+    )
+    add_test(
+        NAME "benchmark_hydrogen_${case_name}"
+        COMMAND "${BFJIT_HYDROGEN_BINARY}" "${source_file}"
+    )
+    set_tests_properties(
+        "benchmark_bfjit_${case_name}"
+        "benchmark_hydrogen_${case_name}"
+        PROPERTIES LABELS "benchmark"
+    )
+endfunction()
+
+bfjit_add_benchmark_case(mandelbrot "${CMAKE_CURRENT_SOURCE_DIR}/examples/mandelbrot.b.txt")
+bfjit_add_benchmark_case(hanoi "${CMAKE_CURRENT_SOURCE_DIR}/examples/hanoi.b.txt")
+
+bfjit_add_benchmark_case(mandelbrot_x2 "${BFJIT_BENCHMARK_CASE_DIR}/mandelbrot_x2.bf")
+bfjit_add_benchmark_case(hanoi_x2 "${BFJIT_BENCHMARK_CASE_DIR}/hanoi_x2.bf")
+bfjit_add_benchmark_case(deep_nesting_512 "${BFJIT_BENCHMARK_CASE_DIR}/deep_nesting_512.bf")
+bfjit_add_benchmark_case(wide_sweep_24k_x128 "${BFJIT_BENCHMARK_CASE_DIR}/wide_sweep_24k_x128.bf")
+bfjit_add_benchmark_case(arith_pipeline_4k "${BFJIT_BENCHMARK_CASE_DIR}/arith_pipeline_4k.bf")
+bfjit_add_benchmark_case(copy_restore_2k "${BFJIT_BENCHMARK_CASE_DIR}/copy_restore_2k.bf")
