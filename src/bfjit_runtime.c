@@ -9,66 +9,66 @@ static int bf_io_putchar(int c) { return putchar_unlocked(c); }
 
 static int bf_io_getchar(void) { return getchar_unlocked(); }
 
-static size_t bf_io_scan_index(const uint8_t *tape, size_t tape_size,
-                               size_t start_index, int64_t step) {
-    int64_t index;
-    int64_t limit;
+static uint8_t *bf_io_scan_index(uint8_t *tape, uint8_t *tape_end,
+                                 uint8_t *start_ptr, int64_t step) {
+    uint8_t *ptr;
 
-    if (tape == NULL || step == 0 || start_index >= tape_size) {
-        return tape_size;
+    if (tape == NULL || tape_end == NULL || start_ptr == NULL || step == 0 ||
+        start_ptr < tape || start_ptr >= tape_end) {
+        return NULL;
     }
 
-    index = (int64_t)start_index;
-    limit = (int64_t)tape_size;
+    ptr = start_ptr;
 
-    while (index >= 0 && index < limit) {
-        if (tape[index] == 0) {
-            return (size_t)index;
+    while (ptr >= tape && ptr < tape_end) {
+        if (*ptr == 0) {
+            return ptr;
         }
-        index += step;
+        ptr += step;
     }
 
-    return tape_size;
+    return NULL;
 }
 
-static size_t bf_io_scan_index_step4(const uint8_t *tape, size_t tape_size,
-                                     size_t start_index) {
-    size_t index;
+static uint8_t *bf_io_scan_index_step4(uint8_t *tape, uint8_t *tape_end,
+                                       uint8_t *start_ptr) {
+    uint8_t *ptr;
 
-    if (tape == NULL || start_index >= tape_size) {
-        return tape_size;
+    if (tape == NULL || tape_end == NULL || start_ptr == NULL ||
+        start_ptr < tape || start_ptr >= tape_end) {
+        return NULL;
     }
 
-    index = start_index;
+    ptr = start_ptr;
 
-    while (index + 12 < tape_size) {
-        if (tape[index] == 0) {
-            return index;
+    while (ptr + 12 < tape_end) {
+        if (ptr[0] == 0) {
+            return ptr;
         }
-        if (tape[index + 4] == 0) {
-            return index + 4;
+        if (ptr[4] == 0) {
+            return ptr + 4;
         }
-        if (tape[index + 8] == 0) {
-            return index + 8;
+        if (ptr[8] == 0) {
+            return ptr + 8;
         }
-        if (tape[index + 12] == 0) {
-            return index + 12;
+        if (ptr[12] == 0) {
+            return ptr + 12;
         }
-        index += 16;
+        ptr += 16;
     }
 
-    while (index < tape_size) {
-        if (tape[index] == 0) {
-            return index;
+    while (ptr < tape_end) {
+        if (*ptr == 0) {
+            return ptr;
         }
-        if (index + 4 < tape_size) {
-            index += 4;
+        if (ptr + 4 < tape_end) {
+            ptr += 4;
         } else {
             break;
         }
     }
 
-    return tape_size;
+    return NULL;
 }
 
 LLVMOrcMaterializationUnitRef bf_create_io_symbols(LLVMOrcLLJITRef jit) {

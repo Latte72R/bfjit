@@ -147,43 +147,7 @@ bool bf_jit_execute_program(const bf_program *program, uint8_t *tape,
     }
 
     if (execution_result < 0) {
-        switch (-execution_result) {
-        case 1:
-            bf_set_jit_err(err, "tape pointer moved out of bounds (add_ptr)");
-            break;
-        case 2:
-            bf_set_jit_err(err,
-                           "tape pointer moved out of bounds (scan memchr)");
-            break;
-        case 3:
-            bf_set_jit_err(err, "tape pointer moved out of bounds (scan)");
-            break;
-        case 4:
-            bf_set_jit_err(err,
-                           "tape pointer moved out of bounds (multiply min)");
-            break;
-        case 5:
-            bf_set_jit_err(err,
-                           "tape pointer moved out of bounds (multiply max)");
-            break;
-        case 6:
-            bf_set_jit_err(err, "tape pointer moved out of bounds (loop min)");
-            break;
-        case 7:
-            bf_set_jit_err(err, "tape pointer moved out of bounds (loop max)");
-            break;
-        case 8:
-            bf_set_jit_err(err,
-                           "tape pointer moved out of bounds (segment min)");
-            break;
-        case 9:
-            bf_set_jit_err(err,
-                           "tape pointer moved out of bounds (segment max)");
-            break;
-        default:
-            bf_set_jit_err(err, "tape pointer moved out of bounds");
-            break;
-        }
+        bf_set_jit_err(err, "tape pointer moved out of bounds");
         return false;
     }
 

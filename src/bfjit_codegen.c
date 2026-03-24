@@ -20,11 +20,11 @@ typedef struct bf_codegen {
     LLVMValueRef oob_reason_ptr;
     LLVMValueRef tape_arg;
     LLVMValueRef tape_size_arg;
-    LLVMValueRef pointer_index;
+    LLVMValueRef tape_end_ptr;
+    LLVMValueRef current_ptr;
     LLVMValueRef memchr_func;
     LLVMValueRef scan_index_func;
     LLVMValueRef scan_index_step4_func;
-    LLVMTypeRef i1_type;
     LLVMTypeRef i8_type;
     LLVMTypeRef i32_type;
     LLVMTypeRef i64_type;
@@ -78,14 +78,20 @@ static LLVMBasicBlockRef bf_get_oob_block(bf_codegen *codegen) {
     return codegen->oob_block;
 }
 
-static void bf_build_bounds_guard(bf_codegen *codegen, LLVMValueRef index,
+static void bf_build_bounds_guard(bf_codegen *codegen, LLVMValueRef ptr,
                                   const char *block_name, uint32_t reason) {
+    LLVMValueRef above_min;
+    LLVMValueRef below_end;
     LLVMValueRef in_bounds;
     LLVMBasicBlockRef continue_block;
     LLVMBasicBlockRef fail_block;
 
-    in_bounds = LLVMBuildICmp(codegen->builder, LLVMIntULT, index,
-                              codegen->tape_size_arg, "in_bounds");
+    above_min = LLVMBuildICmp(codegen->builder, LLVMIntUGE, ptr,
+                              codegen->tape_arg, "above_min");
+    below_end = LLVMBuildICmp(codegen->builder, LLVMIntULT, ptr,
+                              codegen->tape_end_ptr, "below_end");
+    in_bounds =
+        LLVMBuildAnd(codegen->builder, above_min, below_end, "in_bounds");
     continue_block =
         LLVMAppendBasicBlockInContext(codegen->ctx, codegen->func, block_name);
     fail_block =
@@ -101,12 +107,18 @@ static void bf_build_bounds_guard(bf_codegen *codegen, LLVMValueRef index,
 }
 
 static LLVMValueRef bf_build_current_cell_ptr(bf_codegen *codegen) {
-    LLVMValueRef indices[1];
+    return codegen->current_ptr;
+}
 
-    indices[0] = codegen->pointer_index;
+static LLVMValueRef bf_build_checked_current_cell_ptr(bf_codegen *codegen,
+                                                      const char *block_name,
+                                                      uint32_t reason) {
+    if (codegen->suppress_ptr_guards == 0) {
+        bf_build_bounds_guard(codegen, codegen->current_ptr, block_name,
+                              reason);
+    }
 
-    return LLVMBuildGEP2(codegen->builder, codegen->i8_type, codegen->tape_arg,
-                         indices, 1, "cell_ptr");
+    return bf_build_current_cell_ptr(codegen);
 }
 
 static void bf_bounds_include(int value, int *min_value, int *max_value) {
@@ -115,6 +127,76 @@ static void bf_bounds_include(int value, int *min_value, int *max_value) {
     }
     if (value > *max_value) {
         *max_value = value;
+    }
+}
+
+static int bf_analyze_block_bounds_range(const bf_ir_block *block,
+                                         size_t start_index, size_t end_index,
+                                         bf_block_bounds *bounds);
+
+static int bf_analyze_node_bounds(const bf_ir_node *node, int *current_offset,
+                                  int *min_offset, int *max_offset,
+                                  int *has_motion) {
+    switch (node->kind) {
+    case BF_IR_ADD_PTR:
+        *current_offset += node->arg;
+        *has_motion = 1;
+        bf_bounds_include(*current_offset, min_offset, max_offset);
+        return 1;
+    case BF_IR_ADD_DATA:
+    case BF_IR_INPUT:
+    case BF_IR_OUTPUT:
+    case BF_IR_SET_ZERO:
+    case BF_IR_SET_CONST:
+        bf_bounds_include(*current_offset, min_offset, max_offset);
+        return 1;
+    case BF_IR_MULTI_ZERO: {
+        size_t term_index;
+
+        for (term_index = 0; term_index < node->term_count; ++term_index) {
+            bf_bounds_include(*current_offset + node->terms[term_index].offset,
+                              min_offset, max_offset);
+        }
+        *current_offset += node->arg;
+        if (node->arg != 0) {
+            *has_motion = 1;
+            bf_bounds_include(*current_offset, min_offset, max_offset);
+        }
+        return 1;
+    }
+    case BF_IR_MULTIPLY_LOOP: {
+        size_t term_index;
+
+        bf_bounds_include(*current_offset, min_offset, max_offset);
+        for (term_index = 0; term_index < node->term_count; ++term_index) {
+            bf_bounds_include(*current_offset + node->terms[term_index].offset,
+                              min_offset, max_offset);
+        }
+        return 1;
+    }
+    case BF_IR_LOOP: {
+        bf_block_bounds nested_bounds;
+
+        if (!bf_analyze_block_bounds_range(&node->body, 0, node->body.count,
+                                           &nested_bounds) ||
+            nested_bounds.final_offset != 0) {
+            return 0;
+        }
+
+        bf_bounds_include(*current_offset, min_offset, max_offset);
+        bf_bounds_include(*current_offset + nested_bounds.min_offset, min_offset,
+                          max_offset);
+        bf_bounds_include(*current_offset + nested_bounds.max_offset, min_offset,
+                          max_offset);
+        if (nested_bounds.has_motion) {
+            *has_motion = 1;
+        }
+        return 1;
+    }
+    case BF_IR_SCAN:
+        return 0;
+    default:
+        return 0;
     }
 }
 
@@ -133,70 +215,8 @@ static int bf_analyze_block_bounds_range(const bf_ir_block *block,
     has_motion = 0;
 
     for (index = start_index; index < end_index; ++index) {
-        const bf_ir_node *node;
-
-        node = &block->nodes[index];
-        switch (node->kind) {
-        case BF_IR_ADD_PTR:
-            current_offset += node->arg;
-            has_motion = 1;
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            break;
-        case BF_IR_ADD_DATA:
-        case BF_IR_INPUT:
-        case BF_IR_OUTPUT:
-        case BF_IR_SET_ZERO:
-        case BF_IR_SET_CONST:
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            break;
-        case BF_IR_MULTI_ZERO: {
-            size_t term_index;
-
-            for (term_index = 0; term_index < node->term_count; ++term_index) {
-                bf_bounds_include(current_offset +
-                                      node->terms[term_index].offset,
-                                  &min_offset, &max_offset);
-            }
-            current_offset += node->arg;
-            if (node->arg != 0) {
-                has_motion = 1;
-                bf_bounds_include(current_offset, &min_offset, &max_offset);
-            }
-            break;
-        }
-        case BF_IR_MULTIPLY_LOOP: {
-            size_t term_index;
-
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            for (term_index = 0; term_index < node->term_count; ++term_index) {
-                bf_bounds_include(current_offset +
-                                      node->terms[term_index].offset,
-                                  &min_offset, &max_offset);
-            }
-            break;
-        }
-        case BF_IR_LOOP: {
-            bf_block_bounds nested_bounds;
-
-            if (!bf_analyze_block_bounds_range(&node->body, 0, node->body.count,
-                                               &nested_bounds) ||
-                nested_bounds.final_offset != 0) {
-                return 0;
-            }
-
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            bf_bounds_include(current_offset + nested_bounds.min_offset,
-                              &min_offset, &max_offset);
-            bf_bounds_include(current_offset + nested_bounds.max_offset,
-                              &min_offset, &max_offset);
-            if (nested_bounds.has_motion) {
-                has_motion = 1;
-            }
-            break;
-        }
-        case BF_IR_SCAN:
-            return 0;
-        default:
+        if (!bf_analyze_node_bounds(&block->nodes[index], &current_offset,
+                                    &min_offset, &max_offset, &has_motion)) {
             return 0;
         }
     }
@@ -215,25 +235,31 @@ static int bf_analyze_block_bounds(const bf_ir_block *block,
 
 static int bf_find_guarded_range(const bf_ir_block *block, size_t start_index,
                                  size_t *end_index, bf_block_bounds *bounds) {
-    size_t candidate_end;
+    size_t index;
+    int current_offset;
+    int min_offset;
+    int max_offset;
+    int has_motion;
     int found;
 
+    current_offset = 0;
+    min_offset = 0;
+    max_offset = 0;
+    has_motion = 0;
     found = 0;
-    for (candidate_end = start_index + 1; candidate_end <= block->count;
-         ++candidate_end) {
-        bf_block_bounds candidate_bounds;
-
-        if (!bf_analyze_block_bounds_range(block, start_index, candidate_end,
-                                           &candidate_bounds)) {
+    for (index = start_index; index < block->count; ++index) {
+        if (!bf_analyze_node_bounds(&block->nodes[index], &current_offset,
+                                    &min_offset, &max_offset, &has_motion)) {
             break;
         }
 
-        if (candidate_bounds.final_offset == 0 && candidate_bounds.has_motion &&
-            (candidate_bounds.min_offset != 0 ||
-             candidate_bounds.max_offset != 0) &&
-            candidate_end > start_index + 1) {
-            *end_index = candidate_end;
-            *bounds = candidate_bounds;
+        if (has_motion && (min_offset != 0 || max_offset != 0) &&
+            index > start_index) {
+            *end_index = index + 1;
+            bounds->min_offset = min_offset;
+            bounds->max_offset = max_offset;
+            bounds->final_offset = current_offset;
+            bounds->has_motion = has_motion;
             found = 1;
         }
     }
@@ -242,31 +268,74 @@ static int bf_find_guarded_range(const bf_ir_block *block, size_t start_index,
 }
 
 static void bf_build_relative_bounds_guard(bf_codegen *codegen,
-                                           LLVMValueRef base_index,
+                                           LLVMValueRef base_ptr,
                                            int min_offset, int max_offset,
                                            uint32_t min_reason,
                                            uint32_t max_reason) {
-    if (min_offset < 0) {
-        LLVMValueRef min_index;
+    if (min_offset < 0 && max_offset > 0) {
+        LLVMValueRef indices[1];
+        LLVMValueRef min_ptr;
+        LLVMValueRef max_ptr;
+        LLVMValueRef above_min;
+        LLVMValueRef below_end;
+        LLVMValueRef in_bounds;
+        LLVMBasicBlockRef continue_block;
+        LLVMBasicBlockRef fail_block;
 
-        min_index = LLVMBuildAdd(
-            codegen->builder, base_index,
-            LLVMConstInt(codegen->i64_type,
-                         (unsigned long long)(int64_t)min_offset, 1),
-            "loop_guard_min_idx");
-        bf_build_bounds_guard(codegen, min_index, "loop.min.in_bounds",
+        (void)max_reason;
+
+        indices[0] = LLVMConstInt(codegen->i64_type,
+                                  (unsigned long long)(int64_t)min_offset, 1);
+        min_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type, base_ptr,
+                                indices, 1, "guard_min_ptr");
+        indices[0] = LLVMConstInt(codegen->i64_type,
+                                  (unsigned long long)(int64_t)max_offset, 1);
+        max_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type, base_ptr,
+                                indices, 1, "guard_max_ptr");
+        above_min = LLVMBuildICmp(codegen->builder, LLVMIntUGE, min_ptr,
+                                  codegen->tape_arg, "above_min");
+        below_end = LLVMBuildICmp(codegen->builder, LLVMIntULT, max_ptr,
+                                  codegen->tape_end_ptr, "below_end");
+        in_bounds = LLVMBuildAnd(codegen->builder, above_min, below_end,
+                                 "range_in_bounds");
+        continue_block = LLVMAppendBasicBlockInContext(codegen->ctx,
+                                                       codegen->func,
+                                                       "range.in_bounds");
+        fail_block =
+            LLVMAppendBasicBlockInContext(codegen->ctx, codegen->func, "oob.set");
+        LLVMBuildCondBr(codegen->builder, in_bounds, continue_block,
+                        fail_block);
+
+        LLVMPositionBuilderAtEnd(codegen->builder, fail_block);
+        LLVMBuildStore(codegen->builder, bf_const_i32(codegen, min_reason),
+                       codegen->oob_reason_ptr);
+        LLVMBuildBr(codegen->builder, bf_get_oob_block(codegen));
+
+        LLVMPositionBuilderAtEnd(codegen->builder, continue_block);
+        return;
+    }
+
+    if (min_offset < 0) {
+        LLVMValueRef indices[1];
+        LLVMValueRef min_ptr;
+
+        indices[0] = LLVMConstInt(codegen->i64_type,
+                                  (unsigned long long)(int64_t)min_offset, 1);
+        min_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type, base_ptr,
+                                indices, 1, "loop_guard_min_ptr");
+        bf_build_bounds_guard(codegen, min_ptr, "loop.min.in_bounds",
                               min_reason);
     }
 
     if (max_offset > 0) {
-        LLVMValueRef max_index;
+        LLVMValueRef indices[1];
+        LLVMValueRef max_ptr;
 
-        max_index = LLVMBuildAdd(
-            codegen->builder, base_index,
-            LLVMConstInt(codegen->i64_type,
-                         (unsigned long long)(int64_t)max_offset, 1),
-            "loop_guard_max_idx");
-        bf_build_bounds_guard(codegen, max_index, "loop.max.in_bounds",
+        indices[0] = LLVMConstInt(codegen->i64_type,
+                                  (unsigned long long)(int64_t)max_offset, 1);
+        max_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type, base_ptr,
+                                indices, 1, "loop_guard_max_ptr");
+        bf_build_bounds_guard(codegen, max_ptr, "loop.max.in_bounds",
                               max_reason);
     }
 }
@@ -290,7 +359,7 @@ static int bf_codegen_loop(bf_codegen *codegen, const bf_ir_node *node) {
     LLVMValueRef body_end_ptr;
 
     pre_loop_block = LLVMGetInsertBlock(codegen->builder);
-    pre_loop_ptr = codegen->pointer_index;
+    pre_loop_ptr = codegen->current_ptr;
 
     condition_block =
         LLVMAppendBasicBlockInContext(codegen->ctx, codegen->func, "loop.cond");
@@ -319,11 +388,17 @@ static int bf_codegen_loop(bf_codegen *codegen, const bf_ir_node *node) {
     }
 
     LLVMPositionBuilderAtEnd(codegen->builder, condition_block);
-    ptr_phi = LLVMBuildPhi(codegen->builder, codegen->i64_type, "ptr.phi");
+    ptr_phi =
+        LLVMBuildPhi(codegen->builder, codegen->tape_pointer_type, "ptr.phi");
     LLVMAddIncoming(ptr_phi, &pre_loop_ptr, &initial_block, 1);
-    codegen->pointer_index = ptr_phi;
+    codegen->current_ptr = ptr_phi;
 
-    cell_ptr = bf_build_current_cell_ptr(codegen);
+    if (use_loop_guard) {
+        cell_ptr = bf_build_current_cell_ptr(codegen);
+    } else {
+        cell_ptr =
+            bf_build_checked_current_cell_ptr(codegen, "loop.ptr.in_bounds", 6);
+    }
     cell_value = LLVMBuildLoad2(codegen->builder, codegen->i8_type, cell_ptr,
                                 "loop_value");
     loop_condition = LLVMBuildICmp(codegen->builder, LLVMIntNE, cell_value,
@@ -342,7 +417,7 @@ static int bf_codegen_loop(bf_codegen *codegen, const bf_ir_node *node) {
     }
 
     body_end_block = LLVMGetInsertBlock(codegen->builder);
-    body_end_ptr = codegen->pointer_index;
+    body_end_ptr = codegen->current_ptr;
 
     if (LLVMGetBasicBlockTerminator(body_end_block) == NULL) {
         LLVMBuildBr(codegen->builder, condition_block);
@@ -351,7 +426,7 @@ static int bf_codegen_loop(bf_codegen *codegen, const bf_ir_node *node) {
     LLVMAddIncoming(ptr_phi, &body_end_ptr, &body_end_block, 1);
 
     LLVMPositionBuilderAtEnd(codegen->builder, exit_block);
-    codegen->pointer_index = ptr_phi;
+    codegen->current_ptr = ptr_phi;
     return 1;
 }
 
@@ -363,18 +438,16 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
 
     switch (node->kind) {
     case BF_IR_ADD_PTR:
-        updated_value = LLVMBuildAdd(
-            codegen->builder, codegen->pointer_index,
-            LLVMConstInt(codegen->i64_type,
-                         (unsigned long long)(int64_t)node->arg, 1),
-            "ptr_next");
-        if (codegen->suppress_ptr_guards == 0) {
-            bf_build_bounds_guard(codegen, updated_value, "ptr.in_bounds", 1);
-        }
-        codegen->pointer_index = updated_value;
+        call_args[0] = LLVMConstInt(codegen->i64_type,
+                                    (unsigned long long)(int64_t)node->arg, 1);
+        updated_value = LLVMBuildGEP2(codegen->builder, codegen->i8_type,
+                                      codegen->current_ptr, call_args, 1,
+                                      "ptr_next");
+        codegen->current_ptr = updated_value;
         return 1;
     case BF_IR_ADD_DATA:
-        cell_ptr = bf_build_current_cell_ptr(codegen);
+        cell_ptr =
+            bf_build_checked_current_cell_ptr(codegen, "cell.ptr.in_bounds", 1);
         current_value = LLVMBuildLoad2(codegen->builder, codegen->i8_type,
                                        cell_ptr, "cell_value");
         updated_value =
@@ -383,7 +456,8 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
         LLVMBuildStore(codegen->builder, updated_value, cell_ptr);
         return 1;
     case BF_IR_OUTPUT:
-        cell_ptr = bf_build_current_cell_ptr(codegen);
+        cell_ptr = bf_build_checked_current_cell_ptr(codegen,
+                                                    "output.ptr.in_bounds", 1);
         current_value = LLVMBuildLoad2(codegen->builder, codegen->i8_type,
                                        cell_ptr, "output_value");
         call_args[0] = LLVMBuildZExt(codegen->builder, current_value,
@@ -393,7 +467,8 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
                        codegen->putchar_func, call_args, 1, "");
         return 1;
     case BF_IR_INPUT:
-        cell_ptr = bf_build_current_cell_ptr(codegen);
+        cell_ptr =
+            bf_build_checked_current_cell_ptr(codegen, "input.ptr.in_bounds", 1);
         current_value = LLVMBuildCall2(
             codegen->builder, LLVMGlobalGetValueType(codegen->getchar_func),
             codegen->getchar_func, NULL, 0, "input_value");
@@ -404,11 +479,13 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
     case BF_IR_LOOP:
         return bf_codegen_loop(codegen, node);
     case BF_IR_SET_ZERO:
-        cell_ptr = bf_build_current_cell_ptr(codegen);
+        cell_ptr =
+            bf_build_checked_current_cell_ptr(codegen, "zero.ptr.in_bounds", 1);
         LLVMBuildStore(codegen->builder, bf_const_i8(codegen, 0), cell_ptr);
         return 1;
     case BF_IR_SET_CONST:
-        cell_ptr = bf_build_current_cell_ptr(codegen);
+        cell_ptr = bf_build_checked_current_cell_ptr(codegen,
+                                                    "const.ptr.in_bounds", 1);
         LLVMBuildStore(codegen->builder, bf_const_i8(codegen, node->arg),
                        cell_ptr);
         return 1;
@@ -436,36 +513,31 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
                 max_offset = node->arg;
             }
 
-            bf_build_relative_bounds_guard(codegen, codegen->pointer_index,
+            bf_build_relative_bounds_guard(codegen, codegen->current_ptr,
                                            min_offset, max_offset, 8, 9);
         }
 
         for (term_index = 0; term_index < node->term_count; ++term_index) {
-            LLVMValueRef target_idx;
-            LLVMValueRef target_indices[1];
             LLVMValueRef target_ptr;
+            LLVMValueRef target_indices[1];
 
-            target_idx = LLVMBuildAdd(
-                codegen->builder, codegen->pointer_index,
-                LLVMConstInt(
-                    codegen->i64_type,
-                    (unsigned long long)(int64_t)node->terms[term_index].offset,
-                    1),
-                "multi_zero_idx");
-            target_indices[0] = target_idx;
+            target_indices[0] = LLVMConstInt(
+                codegen->i64_type,
+                (unsigned long long)(int64_t)node->terms[term_index].offset, 1);
             target_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type,
-                                       codegen->tape_arg, target_indices, 1,
+                                       codegen->current_ptr, target_indices, 1,
                                        "multi_zero_ptr");
             LLVMBuildStore(codegen->builder, bf_const_i8(codegen, 0),
                            target_ptr);
         }
 
         if (node->arg != 0) {
-            codegen->pointer_index = LLVMBuildAdd(
-                codegen->builder, codegen->pointer_index,
-                LLVMConstInt(codegen->i64_type,
-                             (unsigned long long)(int64_t)node->arg, 1),
-                "multi_zero_ptr_next");
+            call_args[0] = LLVMConstInt(codegen->i64_type,
+                                        (unsigned long long)(int64_t)node->arg,
+                                        1);
+            codegen->current_ptr = LLVMBuildGEP2(
+                codegen->builder, codegen->i8_type, codegen->current_ptr,
+                call_args, 1, "multi_zero_ptr_next");
         }
         return 1;
     }
@@ -478,9 +550,6 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
             LLVMValueRef scan_args[3];
             LLVMValueRef result;
             LLVMValueRef found;
-            LLVMValueRef result_int;
-            LLVMValueRef tape_int;
-            LLVMValueRef new_index;
             LLVMValueRef phi;
             LLVMBasicBlockRef pre_block;
             LLVMBasicBlockRef search_block;
@@ -490,9 +559,11 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
             LLVMValueRef pre_ptr;
 
             pre_block = LLVMGetInsertBlock(codegen->builder);
-            pre_ptr = codegen->pointer_index;
+            pre_ptr = codegen->current_ptr;
 
-            search_ptr = bf_build_current_cell_ptr(codegen);
+            search_ptr =
+                bf_build_checked_current_cell_ptr(codegen,
+                                                 "scan.ptr.in_bounds", 2);
             start_value = LLVMBuildLoad2(codegen->builder, codegen->i8_type,
                                          search_ptr, "scan_start_val");
             start_is_zero =
@@ -511,8 +582,9 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
                             search_block);
 
             LLVMPositionBuilderAtEnd(codegen->builder, search_block);
-            remaining = LLVMBuildSub(codegen->builder, codegen->tape_size_arg,
-                                     codegen->pointer_index, "scan_remaining");
+            remaining = LLVMBuildPtrDiff2(codegen->builder, codegen->i8_type,
+                                          codegen->tape_end_ptr, search_ptr,
+                                          "scan_remaining");
 
             scan_args[0] = search_ptr;
             scan_args[1] = LLVMConstInt(codegen->i32_type, 0, 0);
@@ -533,36 +605,31 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
             LLVMBuildBr(codegen->builder, bf_get_oob_block(codegen));
 
             LLVMPositionBuilderAtEnd(codegen->builder, found_block);
-            result_int = LLVMBuildPtrToInt(codegen->builder, result,
-                                           codegen->i64_type, "scan_result_i");
-            tape_int = LLVMBuildPtrToInt(codegen->builder, codegen->tape_arg,
-                                         codegen->i64_type, "scan_tape_i");
-            new_index = LLVMBuildSub(codegen->builder, result_int, tape_int,
-                                     "scan_new_idx");
             LLVMBuildBr(codegen->builder, done_block);
 
             LLVMPositionBuilderAtEnd(codegen->builder, done_block);
-            phi = LLVMBuildPhi(codegen->builder, codegen->i64_type,
+            phi = LLVMBuildPhi(codegen->builder, codegen->tape_pointer_type,
                                "scan_ptr.phi");
             LLVMAddIncoming(phi, &pre_ptr, &pre_block, 1);
-            LLVMAddIncoming(phi, &new_index, &found_block, 1);
-            codegen->pointer_index = phi;
+            LLVMAddIncoming(phi, &result, &found_block, 1);
+            codegen->current_ptr = phi;
         } else if (node->arg == 4) {
             LLVMValueRef scan_args[3];
-            LLVMValueRef result_idx;
+            LLVMValueRef result_ptr;
             LLVMValueRef found;
             LLVMBasicBlockRef found_block;
             LLVMBasicBlockRef fail_block;
 
             scan_args[0] = codegen->tape_arg;
-            scan_args[1] = codegen->tape_size_arg;
-            scan_args[2] = codegen->pointer_index;
-            result_idx = LLVMBuildCall2(
+            scan_args[1] = codegen->tape_end_ptr;
+            scan_args[2] = codegen->current_ptr;
+            result_ptr = LLVMBuildCall2(
                 codegen->builder,
                 LLVMGlobalGetValueType(codegen->scan_index_step4_func),
                 codegen->scan_index_step4_func, scan_args, 3, "scan_idx4");
-            found = LLVMBuildICmp(codegen->builder, LLVMIntULT, result_idx,
-                                  codegen->tape_size_arg, "scan_found4");
+            found = LLVMBuildICmp(codegen->builder, LLVMIntNE, result_ptr,
+                                  LLVMConstNull(codegen->tape_pointer_type),
+                                  "scan_found4");
             found_block = LLVMAppendBasicBlockInContext(
                 codegen->ctx, codegen->func, "scan4.found");
             fail_block = LLVMAppendBasicBlockInContext(
@@ -575,25 +642,26 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
             LLVMBuildBr(codegen->builder, bf_get_oob_block(codegen));
 
             LLVMPositionBuilderAtEnd(codegen->builder, found_block);
-            codegen->pointer_index = result_idx;
+            codegen->current_ptr = result_ptr;
         } else {
             LLVMValueRef scan_args[4];
-            LLVMValueRef result_idx;
+            LLVMValueRef result_ptr;
             LLVMValueRef found;
             LLVMBasicBlockRef found_block;
             LLVMBasicBlockRef fail_block;
 
             scan_args[0] = codegen->tape_arg;
-            scan_args[1] = codegen->tape_size_arg;
-            scan_args[2] = codegen->pointer_index;
+            scan_args[1] = codegen->tape_end_ptr;
+            scan_args[2] = codegen->current_ptr;
             scan_args[3] = LLVMConstInt(
                 codegen->i64_type, (unsigned long long)(int64_t)node->arg, 1);
-            result_idx = LLVMBuildCall2(
+            result_ptr = LLVMBuildCall2(
                 codegen->builder,
                 LLVMGlobalGetValueType(codegen->scan_index_func),
                 codegen->scan_index_func, scan_args, 4, "scan_idx");
-            found = LLVMBuildICmp(codegen->builder, LLVMIntULT, result_idx,
-                                  codegen->tape_size_arg, "scan_found");
+            found = LLVMBuildICmp(codegen->builder, LLVMIntNE, result_ptr,
+                                  LLVMConstNull(codegen->tape_pointer_type),
+                                  "scan_found");
             found_block = LLVMAppendBasicBlockInContext(
                 codegen->ctx, codegen->func, "scan.found");
             fail_block = LLVMAppendBasicBlockInContext(
@@ -606,12 +674,12 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
             LLVMBuildBr(codegen->builder, bf_get_oob_block(codegen));
 
             LLVMPositionBuilderAtEnd(codegen->builder, found_block);
-            codegen->pointer_index = result_idx;
+            codegen->current_ptr = result_ptr;
         }
         return 1;
     }
     case BF_IR_MULTIPLY_LOOP: {
-        LLVMValueRef base_idx;
+        LLVMValueRef base_ptr;
         LLVMValueRef loop_val;
         LLVMValueRef loop_is_nonzero;
         LLVMBasicBlockRef body_block;
@@ -620,8 +688,9 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
         int max_offset;
         size_t ti;
 
-        cell_ptr = bf_build_current_cell_ptr(codegen);
-        base_idx = codegen->pointer_index;
+        cell_ptr =
+            bf_build_checked_current_cell_ptr(codegen, "mul.ptr.in_bounds", 4);
+        base_ptr = codegen->current_ptr;
 
         loop_val = LLVMBuildLoad2(codegen->builder, codegen->i8_type, cell_ptr,
                                   "mul_loop_val");
@@ -639,9 +708,6 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
         LLVMPositionBuilderAtEnd(codegen->builder, body_block);
 
         if (codegen->suppress_ptr_guards == 0 && node->term_count > 0) {
-            LLVMValueRef min_idx;
-            LLVMValueRef max_idx;
-
             min_offset = node->terms[0].offset;
             max_offset = node->terms[0].offset;
             for (ti = 1; ti < node->term_count; ++ti) {
@@ -653,40 +719,22 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
                 }
             }
 
-            min_idx = LLVMBuildAdd(
-                codegen->builder, base_idx,
-                LLVMConstInt(codegen->i64_type,
-                             (unsigned long long)(int64_t)min_offset, 1),
-                "mul_min_idx");
-            bf_build_bounds_guard(codegen, min_idx, "mul.min.in_bounds", 4);
-
-            if (max_offset != min_offset) {
-                max_idx = LLVMBuildAdd(
-                    codegen->builder, base_idx,
-                    LLVMConstInt(codegen->i64_type,
-                                 (unsigned long long)(int64_t)max_offset, 1),
-                    "mul_max_idx");
-                bf_build_bounds_guard(codegen, max_idx, "mul.max.in_bounds", 5);
-            }
+            bf_build_relative_bounds_guard(codegen, base_ptr, min_offset,
+                                           max_offset, 4, 5);
         }
 
         for (ti = 0; ti < node->term_count; ++ti) {
-            LLVMValueRef target_idx;
             LLVMValueRef target_ptr;
             LLVMValueRef target_indices[1];
             LLVMValueRef old_val;
             LLVMValueRef product;
             LLVMValueRef new_val;
 
-            target_idx = LLVMBuildAdd(
-                codegen->builder, base_idx,
-                LLVMConstInt(
-                    codegen->i64_type,
-                    (unsigned long long)(int64_t)node->terms[ti].offset, 1),
-                "mul_target_idx");
-            target_indices[0] = target_idx;
+            target_indices[0] = LLVMConstInt(
+                codegen->i64_type,
+                (unsigned long long)(int64_t)node->terms[ti].offset, 1);
             target_ptr = LLVMBuildGEP2(codegen->builder, codegen->i8_type,
-                                       codegen->tape_arg, target_indices, 1,
+                                       base_ptr, target_indices, 1,
                                        "mul_target_ptr");
             old_val = LLVMBuildLoad2(codegen->builder, codegen->i8_type,
                                      target_ptr, "mul_old");
@@ -712,7 +760,26 @@ static int bf_codegen_node(bf_codegen *codegen, const bf_ir_node *node) {
 }
 
 static int bf_codegen_block(bf_codegen *codegen, const bf_ir_block *block) {
+    bf_block_bounds block_bounds;
     size_t index;
+
+    if (codegen->suppress_ptr_guards == 0 &&
+        bf_analyze_block_bounds(block, &block_bounds) &&
+        block_bounds.has_motion &&
+        (block_bounds.min_offset != 0 || block_bounds.max_offset != 0)) {
+        bf_build_relative_bounds_guard(codegen, codegen->current_ptr,
+                                       block_bounds.min_offset,
+                                       block_bounds.max_offset, 8, 9);
+        codegen->suppress_ptr_guards += 1;
+        for (index = 0; index < block->count; ++index) {
+            if (!bf_codegen_node(codegen, &block->nodes[index])) {
+                codegen->suppress_ptr_guards -= 1;
+                return 0;
+            }
+        }
+        codegen->suppress_ptr_guards -= 1;
+        return 1;
+    }
 
     for (index = 0; index < block->count;) {
         if (codegen->suppress_ptr_guards == 0) {
@@ -721,7 +788,7 @@ static int bf_codegen_block(bf_codegen *codegen, const bf_ir_block *block) {
 
             if (bf_find_guarded_range(block, index, &guarded_end,
                                       &guarded_bounds)) {
-                bf_build_relative_bounds_guard(codegen, codegen->pointer_index,
+                bf_build_relative_bounds_guard(codegen, codegen->current_ptr,
                                                guarded_bounds.min_offset,
                                                guarded_bounds.max_offset, 8, 9);
                 codegen->suppress_ptr_guards += 1;
@@ -756,14 +823,13 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
     char *target_triple;
     char *verify_msg;
     LLVMModuleRef mod;
-    LLVMValueRef return_value;
+    LLVMValueRef tape_end_indices[1];
 
     memset(&codegen, 0, sizeof(codegen));
     codegen.ctx = ctx;
     codegen.mod = LLVMModuleCreateWithNameInContext("bfjit.mod", ctx);
     codegen.builder = LLVMCreateBuilderInContext(ctx);
     codegen.err = err;
-    codegen.i1_type = LLVMInt1TypeInContext(ctx);
     codegen.i8_type = LLVMInt8TypeInContext(ctx);
     codegen.i32_type = LLVMInt32TypeInContext(ctx);
     codegen.i64_type = LLVMInt64TypeInContext(ctx);
@@ -824,14 +890,16 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
             LLVMFunctionType(codegen.tape_pointer_type, memchr_params, 3, 0));
         bf_add_enum_attr_if_known(ctx, codegen.memchr_func,
                                   LLVMAttributeFunctionIndex, "nounwind", 8);
+        bf_add_enum_attr_if_known(ctx, codegen.memchr_func, 1, "nonnull", 7);
+        bf_add_enum_attr_if_known(ctx, codegen.memchr_func, 1, "nocapture", 9);
 
         scan_params[0] = codegen.tape_pointer_type;
-        scan_params[1] = codegen.i64_type;
-        scan_params[2] = codegen.i64_type;
+        scan_params[1] = codegen.tape_pointer_type;
+        scan_params[2] = codegen.tape_pointer_type;
         scan_params[3] = codegen.i64_type;
         codegen.scan_index_func = LLVMAddFunction(
             codegen.mod, "bf_io_scan_index",
-            LLVMFunctionType(codegen.i64_type, scan_params, 4, 0));
+            LLVMFunctionType(codegen.tape_pointer_type, scan_params, 4, 0));
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_func,
                                   LLVMAttributeFunctionIndex, "nounwind", 8);
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_func,
@@ -842,13 +910,21 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
                                   7);
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_func, 1, "nocapture",
                                   9);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_func, 2, "nonnull",
+                                  7);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_func, 2, "nocapture",
+                                  9);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_func, 3, "nonnull",
+                                  7);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_func, 3, "nocapture",
+                                  9);
 
         scan4_params[0] = codegen.tape_pointer_type;
-        scan4_params[1] = codegen.i64_type;
-        scan4_params[2] = codegen.i64_type;
+        scan4_params[1] = codegen.tape_pointer_type;
+        scan4_params[2] = codegen.tape_pointer_type;
         codegen.scan_index_step4_func = LLVMAddFunction(
             codegen.mod, "bf_io_scan_index_step4",
-            LLVMFunctionType(codegen.i64_type, scan4_params, 3, 0));
+            LLVMFunctionType(codegen.tape_pointer_type, scan4_params, 3, 0));
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func,
                                   LLVMAttributeFunctionIndex, "nounwind", 8);
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func,
@@ -859,6 +935,14 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
                                   "nonnull", 7);
         bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func, 1,
                                   "nocapture", 9);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func, 2,
+                                  "nonnull", 7);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func, 2,
+                                  "nocapture", 9);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func, 3,
+                                  "nonnull", 7);
+        bf_add_enum_attr_if_known(ctx, codegen.scan_index_step4_func, 3,
+                                  "nocapture", 9);
     }
 
     entry_block = LLVMAppendBasicBlockInContext(ctx, codegen.func, "entry");
@@ -867,7 +951,11 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
         LLVMBuildAlloca(codegen.builder, codegen.i32_type, "oob_reason");
     LLVMBuildStore(codegen.builder, bf_const_i32(&codegen, 0),
                    codegen.oob_reason_ptr);
-    codegen.pointer_index = bf_const_i64(&codegen, 0);
+    tape_end_indices[0] = codegen.tape_size_arg;
+    codegen.tape_end_ptr = LLVMBuildGEP2(codegen.builder, codegen.i8_type,
+                                         codegen.tape_arg, tape_end_indices, 1,
+                                         "tape_end");
+    codegen.current_ptr = codegen.tape_arg;
 
     if (!bf_codegen_block(&codegen, &program->root)) {
         LLVMDisposeBuilder(codegen.builder);
@@ -875,9 +963,7 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
         return NULL;
     }
 
-    return_value = codegen.pointer_index;
-    LLVMBuildRet(codegen.builder, LLVMBuildTrunc(codegen.builder, return_value,
-                                                 codegen.i32_type, "result"));
+    LLVMBuildRet(codegen.builder, bf_const_i32(&codegen, 0));
 
     if (codegen.oob_block != NULL &&
         LLVMGetBasicBlockTerminator(codegen.oob_block) == NULL) {
