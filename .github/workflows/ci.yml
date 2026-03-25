@@ -71,9 +71,16 @@ jobs:
           trap 'rm -f "$result_file" "$block_file" "$tmp_readme"' EXIT
 
           hyperfine -w 1 -r 10 -N \
-            -L case mandelbrot_x2,hanoi_x2 \
-            "./build/bfjit ./build/benchmark_cases/{case}.bf" \
-            "/tmp/Brainfuck/extras/hydrogen8 ./build/benchmark_cases/{case}.bf" \
+            "./build/bfjit ./examples/mandelbrot.b.txt" \
+            "/tmp/Brainfuck/extras/hydrogen8 ./examples/mandelbrot.b.txt" \
+            "./build/bfjit ./examples/hanoi.b.txt" \
+            "/tmp/Brainfuck/extras/hydrogen8 ./examples/hanoi.b.txt" \
+            "./build/bfjit ./build/benchmark_cases/deep_nesting_512.bf" \
+            "/tmp/Brainfuck/extras/hydrogen8 ./build/benchmark_cases/deep_nesting_512.bf" \
+            "./build/bfjit ./build/benchmark_cases/arith_pipeline_4k.bf" \
+            "/tmp/Brainfuck/extras/hydrogen8 ./build/benchmark_cases/arith_pipeline_4k.bf" \
+            "./build/bfjit ./build/benchmark_cases/copy_restore_2k.bf" \
+            "/tmp/Brainfuck/extras/hydrogen8 ./build/benchmark_cases/copy_restore_2k.bf" \
             | tee "$result_file"
 
           {
