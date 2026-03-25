@@ -41,6 +41,18 @@ static void bf_program_reset(bf_program *program) {
     bf_ir_block_reset(&program->root);
 }
 
+static bf_ir_node bf_ir_make_node(bf_ir_kind kind, bf_src_loc loc, int arg) {
+    bf_ir_node node;
+
+    node.kind = kind;
+    node.loc = loc;
+    node.arg = arg;
+    bf_ir_block_reset(&node.body);
+    node.terms = NULL;
+    node.term_count = 0;
+    return node;
+}
+
 static void bf_parser_advance(bf_parser *parser) {
     parser->current = bf_lexer_next(&parser->lexer);
 }
@@ -107,7 +119,6 @@ static int bf_ir_block_push(bf_ir_block *block, bf_ir_node node) {
 static int bf_ir_block_append_delta(bf_ir_block *block, bf_ir_kind kind,
                                     int delta, bf_src_loc loc) {
     bf_ir_node *last;
-    bf_ir_node node;
 
     if (delta == 0) {
         return 1;
@@ -124,13 +135,7 @@ static int bf_ir_block_append_delta(bf_ir_block *block, bf_ir_kind kind,
         }
     }
 
-    node.kind = kind;
-    node.loc = loc;
-    node.arg = delta;
-    bf_ir_block_reset(&node.body);
-    node.terms = NULL;
-    node.term_count = 0;
-    return bf_ir_block_push(block, node);
+    return bf_ir_block_push(block, bf_ir_make_node(kind, loc, delta));
 }
 
 static int bf_parse_block(bf_parser *parser, bf_ir_block *block,
@@ -181,12 +186,7 @@ static int bf_parse_block(bf_parser *parser, bf_ir_block *block,
             }
             break;
         case BF_TOKEN_OUTPUT:
-            node.kind = BF_IR_OUTPUT;
-            node.loc = token.loc;
-            node.arg = 0;
-            bf_ir_block_reset(&node.body);
-            node.terms = NULL;
-            node.term_count = 0;
+            node = bf_ir_make_node(BF_IR_OUTPUT, token.loc, 0);
             bf_parser_advance(parser);
             if (!bf_ir_block_push(block, node)) {
                 bf_set_parse_err(
@@ -196,12 +196,7 @@ static int bf_parse_block(bf_parser *parser, bf_ir_block *block,
             }
             break;
         case BF_TOKEN_INPUT:
-            node.kind = BF_IR_INPUT;
-            node.loc = token.loc;
-            node.arg = 0;
-            bf_ir_block_reset(&node.body);
-            node.terms = NULL;
-            node.term_count = 0;
+            node = bf_ir_make_node(BF_IR_INPUT, token.loc, 0);
             bf_parser_advance(parser);
             if (!bf_ir_block_push(block, node)) {
                 bf_set_parse_err(
@@ -211,12 +206,7 @@ static int bf_parse_block(bf_parser *parser, bf_ir_block *block,
             }
             break;
         case BF_TOKEN_LOOP_BEGIN:
-            node.kind = BF_IR_LOOP;
-            node.loc = token.loc;
-            node.arg = 0;
-            bf_ir_block_reset(&node.body);
-            node.terms = NULL;
-            node.term_count = 0;
+            node = bf_ir_make_node(BF_IR_LOOP, token.loc, 0);
             bf_parser_advance(parser);
             if (!bf_parse_block(parser, &node.body, 1, token.loc)) {
                 bf_ir_block_dispose(&node.body);
@@ -271,6 +261,11 @@ bool bf_parse_src(const char *src, size_t length, bf_program *program,
 
     bf_program_reset(program);
     bf_parse_err_reset(err);
+    if (!bf_ir_block_reserve(&program->root, length / 4 + 1)) {
+        bf_set_parse_err(err, (bf_src_loc){0},
+                         "out of memory while reserving IR block");
+        return false;
+    }
 
     bf_lexer_init(&parser.lexer, src, length);
     parser.err = err;

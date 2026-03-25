@@ -8,8 +8,6 @@
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Core.h>
 #include <llvm-c/Target.h>
-#include <llvm-c/TargetMachine.h>
-#include <llvm-c/Transforms/PassBuilder.h>
 
 typedef struct bf_codegen {
     LLVMContextRef ctx;
@@ -41,6 +39,13 @@ typedef struct bf_block_bounds {
     int final_offset;
     int has_motion;
 } bf_block_bounds;
+
+typedef struct bf_bounds_state {
+    int current_offset;
+    int min_offset;
+    int max_offset;
+    int has_motion;
+} bf_bounds_state;
 
 static LLVMValueRef bf_const_i8(bf_codegen *codegen, int value) {
     return LLVMConstInt(codegen->i8_type, (unsigned long long)(uint8_t)value,
@@ -118,93 +123,110 @@ static void bf_bounds_include(int value, int *min_value, int *max_value) {
     }
 }
 
+static int bf_analyze_block_bounds(const bf_ir_block *block,
+                                   bf_block_bounds *bounds);
+
+static void bf_bounds_state_reset(bf_bounds_state *state) {
+    state->current_offset = 0;
+    state->min_offset = 0;
+    state->max_offset = 0;
+    state->has_motion = 0;
+}
+
+static void bf_bounds_state_finish(const bf_bounds_state *state,
+                                   bf_block_bounds *bounds) {
+    bounds->min_offset = state->min_offset;
+    bounds->max_offset = state->max_offset;
+    bounds->final_offset = state->current_offset;
+    bounds->has_motion = state->has_motion;
+}
+
+static int bf_accumulate_node_bounds(const bf_ir_node *node,
+                                     bf_bounds_state *state) {
+    switch (node->kind) {
+    case BF_IR_ADD_PTR:
+        state->current_offset += node->arg;
+        state->has_motion = 1;
+        bf_bounds_include(state->current_offset, &state->min_offset,
+                          &state->max_offset);
+        return 1;
+    case BF_IR_ADD_DATA:
+    case BF_IR_INPUT:
+    case BF_IR_OUTPUT:
+    case BF_IR_SET_ZERO:
+    case BF_IR_SET_CONST:
+        bf_bounds_include(state->current_offset, &state->min_offset,
+                          &state->max_offset);
+        return 1;
+    case BF_IR_MULTI_ZERO: {
+        size_t term_index;
+
+        for (term_index = 0; term_index < node->term_count; ++term_index) {
+            bf_bounds_include(state->current_offset +
+                                  node->terms[term_index].offset,
+                              &state->min_offset, &state->max_offset);
+        }
+
+        state->current_offset += node->arg;
+        if (node->arg != 0) {
+            state->has_motion = 1;
+            bf_bounds_include(state->current_offset, &state->min_offset,
+                              &state->max_offset);
+        }
+        return 1;
+    }
+    case BF_IR_MULTIPLY_LOOP: {
+        size_t term_index;
+
+        bf_bounds_include(state->current_offset, &state->min_offset,
+                          &state->max_offset);
+        for (term_index = 0; term_index < node->term_count; ++term_index) {
+            bf_bounds_include(state->current_offset +
+                                  node->terms[term_index].offset,
+                              &state->min_offset, &state->max_offset);
+        }
+        return 1;
+    }
+    case BF_IR_LOOP: {
+        bf_block_bounds nested_bounds;
+
+        if (!bf_analyze_block_bounds(&node->body, &nested_bounds) ||
+            nested_bounds.final_offset != 0) {
+            return 0;
+        }
+
+        bf_bounds_include(state->current_offset, &state->min_offset,
+                          &state->max_offset);
+        bf_bounds_include(state->current_offset + nested_bounds.min_offset,
+                          &state->min_offset, &state->max_offset);
+        bf_bounds_include(state->current_offset + nested_bounds.max_offset,
+                          &state->min_offset, &state->max_offset);
+        if (nested_bounds.has_motion) {
+            state->has_motion = 1;
+        }
+        return 1;
+    }
+    case BF_IR_SCAN:
+    default:
+        return 0;
+    }
+}
+
 static int bf_analyze_block_bounds_range(const bf_ir_block *block,
                                          size_t start_index, size_t end_index,
                                          bf_block_bounds *bounds) {
     size_t index;
-    int current_offset;
-    int min_offset;
-    int max_offset;
-    int has_motion;
+    bf_bounds_state state;
 
-    current_offset = 0;
-    min_offset = 0;
-    max_offset = 0;
-    has_motion = 0;
+    bf_bounds_state_reset(&state);
 
     for (index = start_index; index < end_index; ++index) {
-        const bf_ir_node *node;
-
-        node = &block->nodes[index];
-        switch (node->kind) {
-        case BF_IR_ADD_PTR:
-            current_offset += node->arg;
-            has_motion = 1;
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            break;
-        case BF_IR_ADD_DATA:
-        case BF_IR_INPUT:
-        case BF_IR_OUTPUT:
-        case BF_IR_SET_ZERO:
-        case BF_IR_SET_CONST:
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            break;
-        case BF_IR_MULTI_ZERO: {
-            size_t term_index;
-
-            for (term_index = 0; term_index < node->term_count; ++term_index) {
-                bf_bounds_include(current_offset +
-                                      node->terms[term_index].offset,
-                                  &min_offset, &max_offset);
-            }
-            current_offset += node->arg;
-            if (node->arg != 0) {
-                has_motion = 1;
-                bf_bounds_include(current_offset, &min_offset, &max_offset);
-            }
-            break;
-        }
-        case BF_IR_MULTIPLY_LOOP: {
-            size_t term_index;
-
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            for (term_index = 0; term_index < node->term_count; ++term_index) {
-                bf_bounds_include(current_offset +
-                                      node->terms[term_index].offset,
-                                  &min_offset, &max_offset);
-            }
-            break;
-        }
-        case BF_IR_LOOP: {
-            bf_block_bounds nested_bounds;
-
-            if (!bf_analyze_block_bounds_range(&node->body, 0, node->body.count,
-                                               &nested_bounds) ||
-                nested_bounds.final_offset != 0) {
-                return 0;
-            }
-
-            bf_bounds_include(current_offset, &min_offset, &max_offset);
-            bf_bounds_include(current_offset + nested_bounds.min_offset,
-                              &min_offset, &max_offset);
-            bf_bounds_include(current_offset + nested_bounds.max_offset,
-                              &min_offset, &max_offset);
-            if (nested_bounds.has_motion) {
-                has_motion = 1;
-            }
-            break;
-        }
-        case BF_IR_SCAN:
-            return 0;
-        default:
+        if (!bf_accumulate_node_bounds(&block->nodes[index], &state)) {
             return 0;
         }
     }
 
-    bounds->min_offset = min_offset;
-    bounds->max_offset = max_offset;
-    bounds->final_offset = current_offset;
-    bounds->has_motion = has_motion;
+    bf_bounds_state_finish(&state, bounds);
     return 1;
 }
 
@@ -215,27 +237,38 @@ static int bf_analyze_block_bounds(const bf_ir_block *block,
 
 static int bf_find_guarded_range(const bf_ir_block *block, size_t start_index,
                                  size_t *end_index, bf_block_bounds *bounds) {
-    size_t candidate_end;
+    size_t index;
+    size_t best_end;
+    bf_bounds_state state;
     int found;
 
+    bf_bounds_state_reset(&state);
+    best_end = start_index;
     found = 0;
-    for (candidate_end = start_index + 1; candidate_end <= block->count;
-         ++candidate_end) {
-        bf_block_bounds candidate_bounds;
 
-        if (!bf_analyze_block_bounds_range(block, start_index, candidate_end,
-                                           &candidate_bounds)) {
+    for (index = start_index; index < block->count; ++index) {
+        const bf_ir_node *node;
+
+        node = &block->nodes[index];
+        if (node->kind != BF_IR_ADD_PTR && node->kind != BF_IR_ADD_DATA &&
+            node->kind != BF_IR_INPUT && node->kind != BF_IR_OUTPUT &&
+            node->kind != BF_IR_SET_ZERO && node->kind != BF_IR_SET_CONST) {
             break;
         }
 
-        if (candidate_bounds.final_offset == 0 && candidate_bounds.has_motion &&
-            (candidate_bounds.min_offset != 0 ||
-             candidate_bounds.max_offset != 0) &&
-            candidate_end > start_index + 1) {
-            *end_index = candidate_end;
-            *bounds = candidate_bounds;
-            found = 1;
+        if (!bf_accumulate_node_bounds(node, &state)) {
+            break;
         }
+
+        if (state.has_motion && index > start_index) {
+            best_end = index + 1;
+            found = 1;
+            bf_bounds_state_finish(&state, bounds);
+        }
+    }
+
+    if (found) {
+        *end_index = best_end;
     }
 
     return found;
@@ -905,50 +938,8 @@ LLVMModuleRef bf_build_module(LLVMContextRef ctx, const bf_program *program,
 }
 
 int bf_opt_llvm_module(LLVMModuleRef mod, bf_jit_err *err) {
-    LLVMTargetRef target;
-    LLVMTargetMachineRef target_machine;
-    LLVMPassBuilderOptionsRef pass_options;
-    LLVMErrorRef llvm_err;
-    char *triple;
-    char *cpu;
-    char *features;
-    char *err_msg;
-
-    triple = LLVMGetDefaultTargetTriple();
-
-    if (LLVMGetTargetFromTriple(triple, &target, &err_msg) != 0) {
-        bf_set_jit_err(err,
-                       err_msg != NULL ? err_msg : "failed to resolve target");
-        LLVMDisposeMessage(err_msg);
-        LLVMDisposeMessage(triple);
-        return 0;
-    }
-
-    cpu = LLVMGetHostCPUName();
-    features = LLVMGetHostCPUFeatures();
-
-    target_machine = LLVMCreateTargetMachine(
-        target, triple, cpu, features, LLVMCodeGenLevelAggressive,
-        LLVMRelocDefault, LLVMCodeModelDefault);
-    LLVMDisposeMessage(triple);
-    LLVMDisposeMessage(cpu);
-    LLVMDisposeMessage(features);
-
-    if (target_machine == NULL) {
-        bf_set_jit_err(err, "failed to create target machine");
-        return 0;
-    }
-
-    pass_options = LLVMCreatePassBuilderOptions();
-    llvm_err = LLVMRunPasses(mod,
-                             "function(instcombine<no-verify-fixpoint>,"
-                             "simplifycfg,gvn)",
-                             target_machine, pass_options);
-    LLVMDisposePassBuilderOptions(pass_options);
-    LLVMDisposeTargetMachine(target_machine);
-
-    if (llvm_err != NULL) {
-        bf_set_jit_err_from_llvm(err, llvm_err);
+    if (mod == NULL) {
+        bf_set_jit_err(err, "module must be non-null");
         return 0;
     }
 

@@ -3,18 +3,290 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct bf_const_cell {
+    int offset;
+    int value;
+} bf_const_cell;
+
+static int bf_opt_reserve_nodes(bf_ir_block *block, size_t capacity) {
+    bf_ir_node *nodes;
+    size_t new_capacity;
+
+    if (block->capacity >= capacity) {
+        return 1;
+    }
+
+    new_capacity = block->capacity == 0 ? 8 : block->capacity;
+    while (new_capacity < capacity) {
+        new_capacity *= 2;
+    }
+
+    nodes = realloc(block->nodes, new_capacity * sizeof(*nodes));
+    if (nodes == NULL) {
+        return 0;
+    }
+
+    block->nodes = nodes;
+    block->capacity = new_capacity;
+    return 1;
+}
+
+static int bf_opt_push_node(bf_ir_block *block, const bf_ir_node *node) {
+    if (!bf_opt_reserve_nodes(block, block->count + 1)) {
+        return 0;
+    }
+
+    block->nodes[block->count] = *node;
+    block->count += 1;
+    return 1;
+}
+
+static int bf_wrap_u8(int value) {
+    value %= 256;
+    if (value < 0) {
+        value += 256;
+    }
+    return value;
+}
+
+static size_t bf_find_const_cell(const bf_const_cell *cells, size_t count,
+                                 int offset) {
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        if (cells[index].offset == offset) {
+            return index;
+        }
+    }
+
+    return count;
+}
+
+static int bf_set_const_cell(bf_const_cell **cells, size_t *count,
+                             size_t *capacity, int offset, int value) {
+    size_t index;
+    bf_const_cell *new_cells;
+    size_t new_capacity;
+
+    index = bf_find_const_cell(*cells, *count, offset);
+    if (index < *count) {
+        (*cells)[index].value = bf_wrap_u8(value);
+        return 1;
+    }
+
+    if (*count == *capacity) {
+        new_capacity = *capacity == 0 ? 8 : (*capacity * 2);
+        new_cells = realloc(*cells, new_capacity * sizeof(**cells));
+        if (new_cells == NULL) {
+            return 0;
+        }
+        *cells = new_cells;
+        *capacity = new_capacity;
+    }
+
+    (*cells)[*count].offset = offset;
+    (*cells)[*count].value = bf_wrap_u8(value);
+    *count += 1;
+    return 1;
+}
+
+static int bf_get_const_cell(const bf_const_cell *cells, size_t count,
+                             int offset) {
+    size_t index;
+
+    index = bf_find_const_cell(cells, count, offset);
+    if (index == count) {
+        return 0;
+    }
+
+    return cells[index].value;
+}
+
+static int bf_compare_const_cells(const void *lhs, const void *rhs) {
+    const bf_const_cell *a;
+    const bf_const_cell *b;
+
+    a = lhs;
+    b = rhs;
+    if (a->offset < b->offset) {
+        return -1;
+    }
+    if (a->offset > b->offset) {
+        return 1;
+    }
+    return 0;
+}
+
+static int bf_try_fold_constant_block(bf_ir_block *block) {
+    bf_const_cell *cells;
+    size_t count;
+    size_t capacity;
+    size_t index;
+    int current_offset;
+    bf_ir_block lowered;
+    int cursor;
+
+    cells = NULL;
+    count = 0;
+    capacity = 0;
+    current_offset = 0;
+
+    lowered.nodes = NULL;
+    lowered.count = 0;
+    lowered.capacity = 0;
+
+    for (index = 0; index < block->count; ++index) {
+        bf_ir_node *node;
+
+        node = &block->nodes[index];
+        switch (node->kind) {
+        case BF_IR_ADD_PTR:
+            current_offset += node->arg;
+            break;
+        case BF_IR_ADD_DATA:
+            if (!bf_set_const_cell(&cells, &count, &capacity, current_offset,
+                                   bf_get_const_cell(cells, count,
+                                                     current_offset) +
+                                       node->arg)) {
+                free(cells);
+                return 0;
+            }
+            break;
+        case BF_IR_SET_ZERO:
+            if (!bf_set_const_cell(&cells, &count, &capacity, current_offset,
+                                   0)) {
+                free(cells);
+                return 0;
+            }
+            break;
+        case BF_IR_SET_CONST:
+            if (!bf_set_const_cell(&cells, &count, &capacity, current_offset,
+                                   node->arg)) {
+                free(cells);
+                return 0;
+            }
+            break;
+        case BF_IR_MULTI_ZERO: {
+            size_t term_index;
+
+            for (term_index = 0; term_index < node->term_count; ++term_index) {
+                if (!bf_set_const_cell(&cells, &count, &capacity,
+                                       current_offset +
+                                           node->terms[term_index].offset,
+                                       0)) {
+                    free(cells);
+                    return 0;
+                }
+            }
+            current_offset += node->arg;
+            break;
+        }
+        case BF_IR_MULTIPLY_LOOP: {
+            size_t term_index;
+            int source;
+
+            source = bf_get_const_cell(cells, count, current_offset);
+            for (term_index = 0; term_index < node->term_count; ++term_index) {
+                int target_offset;
+                int target_value;
+
+                target_offset = current_offset + node->terms[term_index].offset;
+                target_value = bf_get_const_cell(cells, count, target_offset);
+                if (!bf_set_const_cell(&cells, &count, &capacity, target_offset,
+                                       target_value +
+                                           source * node->terms[term_index].factor)) {
+                    free(cells);
+                    return 0;
+                }
+            }
+            if (!bf_set_const_cell(&cells, &count, &capacity, current_offset, 0)) {
+                free(cells);
+                return 0;
+            }
+            break;
+        }
+        default:
+            free(cells);
+            return 0;
+        }
+    }
+
+    qsort(cells, count, sizeof(*cells), bf_compare_const_cells);
+    cursor = 0;
+
+    for (index = 0; index < count; ++index) {
+        bf_ir_node node;
+
+        if (cells[index].value == 0) {
+            continue;
+        }
+
+        if (cells[index].offset != cursor) {
+        memset(&node, 0, sizeof(node));
+        node.kind = BF_IR_ADD_PTR;
+        node.arg = cells[index].offset - cursor;
+            if (!bf_opt_push_node(&lowered, &node)) {
+                free(cells);
+                bf_ir_block_dispose(&lowered);
+                return 0;
+            }
+            cursor = cells[index].offset;
+        }
+
+        memset(&node, 0, sizeof(node));
+        node.kind = BF_IR_SET_CONST;
+        node.arg = cells[index].value;
+        if (!bf_opt_push_node(&lowered, &node)) {
+            free(cells);
+            bf_ir_block_dispose(&lowered);
+            return 0;
+        }
+    }
+
+    if (current_offset != cursor) {
+        bf_ir_node tail;
+
+        memset(&tail, 0, sizeof(tail));
+        tail.kind = BF_IR_ADD_PTR;
+        tail.arg = current_offset - cursor;
+        if (!bf_opt_push_node(&lowered, &tail)) {
+            free(cells);
+            bf_ir_block_dispose(&lowered);
+            return 0;
+        }
+    }
+
+    free(cells);
+    free(block->nodes);
+    *block = lowered;
+    return 1;
+}
+
 static void bf_opt_set_zero(bf_ir_node *node) {
     const bf_ir_block *body;
+    const bf_ir_node *inner;
 
     if (node->kind != BF_IR_LOOP || node->body.count != 1) {
         return;
     }
 
     body = &node->body;
+    inner = &body->nodes[0];
 
     /* [-] or [+]: ループ消去 */
-    if (body->nodes[0].kind == BF_IR_ADD_DATA &&
-        (body->nodes[0].arg == -1 || body->nodes[0].arg == 1)) {
+    if (inner->kind == BF_IR_ADD_DATA && (inner->arg == -1 || inner->arg == 1)) {
+        bf_ir_block_dispose(&node->body);
+        node->kind = BF_IR_SET_ZERO;
+        node->arg = 0;
+        return;
+    }
+
+    /*
+     * [set_zero] や [[[-]]] のような冗長ループも 1 回で十分。
+     * ループ本体が現在セルを 0 にし、ポインタを動かさないなら LOOP は不要。
+     */
+    if ((inner->kind == BF_IR_SET_ZERO) ||
+        (inner->kind == BF_IR_SET_CONST && inner->arg == 0)) {
         bf_ir_block_dispose(&node->body);
         node->kind = BF_IR_SET_ZERO;
         node->arg = 0;
@@ -22,8 +294,8 @@ static void bf_opt_set_zero(bf_ir_node *node) {
     }
 
     /* [>] or [<] or [>>>] etc: ループ解析 */
-    if (body->nodes[0].kind == BF_IR_ADD_PTR) {
-        int step = body->nodes[0].arg;
+    if (inner->kind == BF_IR_ADD_PTR) {
+        int step = inner->arg;
         bf_ir_block_dispose(&node->body);
         node->kind = BF_IR_SCAN;
         node->arg = step;
@@ -442,4 +714,5 @@ void bf_opt_program(bf_program *program) {
     }
 
     bf_opt_block(&program->root);
+    (void)bf_try_fold_constant_block(&program->root);
 }
